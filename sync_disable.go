@@ -4,6 +4,8 @@ package deadlock
 
 import "sync"
 
+const hasTryLock = false
+
 // StandardMutex wraps sync.Mutex with no deadlock detection
 type StandardMutex struct {
 	mu sync.Mutex

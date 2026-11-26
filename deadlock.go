@@ -103,7 +103,7 @@ type Mutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *Mutex) Lock() {
-	lock(m.mu.Lock, m)
+	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, m)
 }
 
 // Unlock unlocks the mutex.
@@ -135,7 +135,7 @@ type RWMutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) Lock() {
-	lock(m.mu.Lock, m)
+	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, m)
 }
 
 // Unlock unlocks the mutex for writing.  It is a run-time error if rw is
@@ -156,7 +156,7 @@ func (m *RWMutex) Unlock() {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) RLock() {
-	lock(m.mu.RLock, m)
+	lock(m.mu.RLock, m.mu.TryRLock, m.mu.RUnlock, m)
 }
 
 // RUnlock undoes a single RLock call;
@@ -177,40 +177,60 @@ func (m *RWMutex) RLocker() sync.Locker {
 }
 
 func preLock(stack []uintptr, p interface{}) {
-	lo.preLock(stack, p)
+	lo.preLock(goid.Get(), stack, p)
 }
 
 func postLock(stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
-	lo.postLock(stack, buf, p)
+	lo.postLock(goid.Get(), stack, buf, p)
 }
 
 func postUnlock(p interface{}) {
 	lo.postUnlock(p)
 }
 
-func lock(lockFn func(), ptr interface{}) {
+func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}) {
 	if Opts.Disable {
 		lockFn()
 		return
 	}
+	gid := goid.Get()
 	stack, buf := callers(1)
+
+	// Fast path for uncontended locks: skip the deadlock timeout timer and
+	// combine order checking with holder registration under a single lo.mu lock.
+	if hasTryLock && tryLockFn != nil && tryLockFn() {
+		violations := lo.preAndPostLock(gid, stack, buf, ptr)
+		if violations > 0 {
+			// Roll back lock acquisition and tracking if the callback panics.
+			panicked := true
+			defer func() {
+				if panicked {
+					lo.postUnlock(ptr)
+					unlockFn()
+				}
+			}()
+			for i := 0; i < violations; i++ {
+				Opts.OnPotentialDeadlock()
+			}
+			panicked = false
+		}
+		return
+	}
+
 	// Cache timeout before preLock so all Opts reads complete before preLock
 	// may call OnPotentialDeadlock. If preLock detects a problem (recursive
 	// lock, order violation) the goroutine may block forever in lockFn below,
 	// and reading Opts after preLock would race with any later Opts write.
 	timeout := Opts.DeadlockTimeout
-	preLock(stack, ptr)
+	lo.preLock(gid, stack, ptr)
 	if timeout <= 0 {
 		lockFn()
 	} else {
-		currentID := goid.Get()
-		e := dw.register(stack, ptr, currentID, timeout)
+		e := dw.register(stack, ptr, gid, timeout)
 		lockFn()
 		dw.deregister(e)
-		postLock(stack, buf, ptr)
-		return
 	}
-	postLock(stack, buf, ptr)
+	lo.postLock(gid, stack, buf, ptr)
 }
 
 // pendingEntry tracks a goroutine that is waiting to acquire a lock. Entries are
@@ -409,20 +429,15 @@ var heldPool = sync.Pool{
 	},
 }
 
-// postLock records the current goroutine as a holder of lock p. It reuses
-// pooled slice pointers before allocating, and stores the pooled stack buffer
-// in the entry so postUnlock can release it later.
-func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
-	gid := goid.Get()
-	entry := stackGID{stack, gid, buf}
-	l.mu.Lock()
+// postLockLocked records gid as a holder of lock p while l.mu is held.
+func (l *lockOrder) postLockLocked(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
 	hp := l.cur[p]
 	if hp == nil {
 		hp = holdersPool.Get().(*[]stackGID)
 		*hp = (*hp)[:0]
 		l.cur[p] = hp
 	}
-	*hp = append(*hp, entry)
+	*hp = append(*hp, stackGID{stack, gid, buf})
 
 	gh := l.byGid[gid]
 	if gh == nil {
@@ -431,6 +446,14 @@ func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p inte
 		l.byGid[gid] = gh
 	}
 	*gh = append(*gh, heldLock{ptr: p, stack: stack})
+}
+
+// postLock records gid as a holder of lock p. It reuses pooled slice pointers
+// before allocating, and stores the pooled stack buffer in the entry so
+// postUnlock can release it later.
+func (l *lockOrder) postLock(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
+	l.mu.Lock()
+	l.postLockLocked(gid, stack, buf, p)
 	l.mu.Unlock()
 }
 
@@ -494,11 +517,20 @@ func (l *lockOrder) checkOrderLocked(gid int64, stack []uintptr, p interface{}) 
 	return violations
 }
 
-func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
+// preAndPostLock checks lock ordering and registers the acquisition under a
+// single l.mu lock for the TryLock/TryRLock fast path.
+func (l *lockOrder) preAndPostLock(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) int {
+	l.mu.Lock()
+	violations := l.checkOrderLocked(gid, stack, p)
+	l.postLockLocked(gid, stack, buf, p)
+	l.mu.Unlock()
+	return violations
+}
+
+func (l *lockOrder) preLock(gid int64, stack []uintptr, p interface{}) {
 	if Opts.DisableLockOrderDetection {
 		return
 	}
-	gid := goid.Get()
 	l.mu.Lock()
 	violations := l.checkOrderLocked(gid, stack, p)
 	l.mu.Unlock()

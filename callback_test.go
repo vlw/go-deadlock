@@ -150,3 +150,35 @@ func TestOnPotentialDeadlockConcurrentMutationsSafe(t *testing.T) {
 		t.Fatalf("expected at least 5 callbacks, got %d", got)
 	}
 }
+
+// TestRecursiveRLockFastPath verifies that the TryRLock fast path still detects
+// recursive RLock calls on the same goroutine and releases the lock on callback panic.
+func TestRecursiveRLockFastPath(t *testing.T) {
+	defer restore()()
+	Opts.DeadlockTimeout = 0
+
+	var a RWMutex
+	Opts.OnPotentialDeadlock = func() {
+		panic("recursive-rlock")
+	}
+
+	var panicked uint32
+	func() {
+		defer func() {
+			if recover() != nil {
+				atomic.StoreUint32(&panicked, 1)
+			}
+		}()
+		a.RLock()
+		defer a.RUnlock()
+		a.RLock()
+		a.RUnlock()
+	}()
+
+	if atomic.LoadUint32(&panicked) == 0 {
+		t.Fatal("expected panic on recursive RLock")
+	}
+	// Both RLock calls must be released after panic rollback so write Lock succeeds.
+	a.Lock()
+	a.Unlock()
+}
