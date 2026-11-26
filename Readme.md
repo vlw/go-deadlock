@@ -18,15 +18,17 @@
 
 ### Benchmarks
 
-Measured with Go `1.27.4` on `linux/amd64` (AMD Ryzen 9 9950X3D, `GOMAXPROCS=32`, median of 3 runs, `-benchtime=500ms`):
+Go 1.27.4, `linux/amd64` (AMD Ryzen 9 9950X3D, `GOMAXPROCS=32`, median of 3 runs, `-benchtime=500ms`). Upstream baseline: `sasha-s/go-deadlock` (`222d9c9`). Values are per operation (`ns/op`, bytes/allocs).
 
-| Benchmark | Upstream `sasha-s/go-deadlock` (`222d9c9`) | This fork `vlw/go-deadlock` (`v1.0.0`) | Stdlib `sync.Mutex` (Go 1.27.4) | Speedup vs Upstream |
+| Benchmark | Upstream | Fork `v1.0.0` | `sync.Mutex` | Speedup |
 |---|---:|---:|---:|---:|
-| `Lock`/`Unlock` (1T) | `390.3 ns/op` · `24 B/op` · `1 allocs/op` | `27.87 ns/op` · `0 B/op` · `0 allocs/op` | `7.20 ns/op` · `0 B/op` · `0 allocs/op` | **14.0×** |
-| Nested 2 locks (1T) | `959.1 ns/op` · `144 B/op` · `4 allocs/op` | `67.17 ns/op` · `0 B/op` · `0 allocs/op` | `14.22 ns/op` · `0 B/op` · `0 allocs/op` | **14.3×** |
-| `Lock`/`Unlock` with 128 background holders (1T) | `1217 ns/op` · `24 B/op` · `1 allocs/op` | `27.91 ns/op` · `0 B/op` · `0 allocs/op` | `7.19 ns/op` · `0 B/op` · `0 allocs/op` | **43.6×** |
-| Parallel disjoint `Lock`/`Unlock` (32T) | `624.6 ns/op` · `24 B/op` · `1 allocs/op` | `1.07 ns/op` · `0 B/op` · `0 allocs/op` | `0.26 ns/op` · `0 B/op` · `0 allocs/op` | **~584×** |
-| Parallel nested 2 locks (32T) | `1161 ns/op` · `112 B/op` · `4 allocs/op` | `12.74 ns/op` *(4.76–13.87)* · `0 B/op` · `0 allocs/op` | `0.53 ns/op` · `0 B/op` · `0 allocs/op` | **~91×** |
+| Single (1T) | 390.3 ns<br><sub>24 B, 1 alloc</sub> | **27.87 ns**<br><sub>0 B, 0 allocs</sub> | 7.20 ns<br><sub>0 B, 0 allocs</sub> | **14.0×** |
+| Nested 2 locks (1T) | 959.1 ns<br><sub>144 B, 4 allocs</sub> | **67.17 ns**<br><sub>0 B, 0 allocs</sub> | 14.22 ns<br><sub>0 B, 0 allocs</sub> | **14.3×** |
+| 128 background holders (1T) | 1217 ns<br><sub>24 B, 1 alloc</sub> | **27.91 ns**<br><sub>0 B, 0 allocs</sub> | 7.19 ns<br><sub>0 B, 0 allocs</sub> | **43.6×** |
+| Parallel disjoint (32T) | 624.6 ns<br><sub>24 B, 1 alloc</sub> | **1.07 ns**<br><sub>0 B, 0 allocs</sub> | 0.26 ns<br><sub>0 B, 0 allocs</sub> | **~584×** |
+| Parallel nested 2 (32T) | 1161 ns<br><sub>112 B, 4 allocs</sub> | **12.74 ns**\*<br><sub>0 B, 0 allocs</sub> | 0.53 ns<br><sub>0 B, 0 allocs</sub> | **~91×** |
+
+<sub>\* Parallel nested 2 ranged from `4.76 ns` to `13.87 ns` across runs depending on GID shard collisions.</sub>
 
 ## Why
 Deadlocks happen and are painful to debug.
