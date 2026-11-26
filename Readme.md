@@ -1,5 +1,33 @@
 # Online deadlock detection in go (golang). [![Try it online](https://img.shields.io/badge/try%20it-online-blue.svg)](https://wandbox.org/permlink/hJc6QCZowxbNm9WW) [![Docs](https://godoc.org/github.com/sasha-s/go-deadlock?status.svg)](https://godoc.org/github.com/sasha-s/go-deadlock) [![codecov](https://codecov.io/gh/sasha-s/go-deadlock/branch/main/graph/badge.svg)](https://codecov.io/gh/sasha-s/go-deadlock) [![version](https://badge.fury.io/gh/sasha-s%2Fgo-deadlock.svg)](https://github.com/sasha-s/go-deadlock/releases) [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
+> **Performance & Stability Fork (`github.com/vlw/go-deadlock`)**
+>
+> This is an actively maintained fork of [`sasha-s/go-deadlock`](https://github.com/sasha-s/go-deadlock) focused on **production performance, stability, and minimal CPU, memory, and allocation overhead** without compromising any deadlock-detection capabilities:
+> - **Zero allocations (`0 B/op, 0 allocs/op`)** on uncontended lock/unlock and steady-state nested lock-order checks.
+> - **Zero per-mutex memory overhead**: `sizeof(deadlock.Mutex) == sizeof(sync.Mutex)` (`8 B`) and `sizeof(deadlock.RWMutex) == sizeof(sync.RWMutex)` (`24 B`).
+> - **High multi-core scalability**: 256 cache-line-padded (128-byte) goroutine-ID shards with inline slots and a 64-shard lock-free canonical lock-order table (no global lock on the fast path).
+> - **Fast stack capture**: frame-pointer unwinding on `amd64`/`arm64` with lazy `runtime.CallersFrames` expansion on deadlock reports (automatic `runtime.Callers` fallback on all other architectures and with `-tags deadlock_no_fpunwind`).
+> - **Stability fixes**: safe `OnPotentialDeadlock` callback execution outside internal locks (fixes deadlocks on slow/panicking callbacks), safe `TryLock`/`TryRLock` failure handling, and full GC compatibility via `weak.Pointer`.
+> - **Requires Go 1.27+**.
+>
+> To use this fork as a drop-in replacement without changing imports (automatically resolves to the latest release):
+> ```sh
+> go mod edit -replace github.com/sasha-s/go-deadlock=github.com/vlw/go-deadlock@latest
+> go mod tidy
+> ```
+
+### Benchmarks
+
+Measured with Go `1.27.4` on `linux/amd64` (AMD Ryzen 9 9950X3D, `GOMAXPROCS=32`, median of 3 runs, `-benchtime=500ms`):
+
+| Benchmark | Upstream `sasha-s/go-deadlock` (`222d9c9`) | This fork `vlw/go-deadlock` (`v1.0.0`) | Stdlib `sync.Mutex` (Go 1.27.4) | Speedup vs Upstream |
+|---|---:|---:|---:|---:|
+| `Lock`/`Unlock` (1T) | `390.3 ns/op` · `24 B/op` · `1 allocs/op` | `27.87 ns/op` · `0 B/op` · `0 allocs/op` | `7.20 ns/op` · `0 B/op` · `0 allocs/op` | **14.0×** |
+| Nested 2 locks (1T) | `959.1 ns/op` · `144 B/op` · `4 allocs/op` | `67.17 ns/op` · `0 B/op` · `0 allocs/op` | `14.22 ns/op` · `0 B/op` · `0 allocs/op` | **14.3×** |
+| `Lock`/`Unlock` with 128 background holders (1T) | `1217 ns/op` · `24 B/op` · `1 allocs/op` | `27.91 ns/op` · `0 B/op` · `0 allocs/op` | `7.19 ns/op` · `0 B/op` · `0 allocs/op` | **43.6×** |
+| Parallel disjoint `Lock`/`Unlock` (32T) | `624.6 ns/op` · `24 B/op` · `1 allocs/op` | `1.07 ns/op` · `0 B/op` · `0 allocs/op` | `0.26 ns/op` · `0 B/op` · `0 allocs/op` | **~584×** |
+| Parallel nested 2 locks (32T) | `1161 ns/op` · `112 B/op` · `4 allocs/op` | `12.74 ns/op` *(4.76–13.87)* · `0 B/op` · `0 allocs/op` | `0.53 ns/op` · `0 B/op` · `0 allocs/op` | **~91×** |
+
 ## Why
 Deadlocks happen and are painful to debug.
 
