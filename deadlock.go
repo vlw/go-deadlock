@@ -105,7 +105,17 @@ type Mutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *Mutex) Lock() {
-	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
+	if Opts.Disable {
+		m.mu.Lock()
+		return
+	}
+	if m.mu.TryLock() {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.Unlock)
+		}
+		return
+	}
+	lockSlow(m.mu.Lock, unsafe.Pointer(m))
 }
 
 // Unlock unlocks the mutex.
@@ -137,7 +147,17 @@ type RWMutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) Lock() {
-	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
+	if Opts.Disable {
+		m.mu.Lock()
+		return
+	}
+	if m.mu.TryLock() {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.Unlock)
+		}
+		return
+	}
+	lockSlow(m.mu.Lock, unsafe.Pointer(m))
 }
 
 // Unlock unlocks the mutex for writing.  It is a run-time error if rw is
@@ -158,7 +178,17 @@ func (m *RWMutex) Unlock() {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) RLock() {
-	lock(m.mu.RLock, m.mu.TryRLock, m.mu.RUnlock, unsafe.Pointer(m))
+	if Opts.Disable {
+		m.mu.RLock()
+		return
+	}
+	if m.mu.TryRLock() {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.RUnlock)
+		}
+		return
+	}
+	lockSlow(m.mu.RLock, unsafe.Pointer(m))
 }
 
 // RUnlock undoes a single RLock call;
@@ -178,34 +208,30 @@ func (m *RWMutex) RLocker() sync.Locker {
 	return m.mu.RLocker()
 }
 
-func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr unsafe.Pointer) {
-	if Opts.Disable {
-		lockFn()
-		return
-	}
-	gid := goid.Get()
-
-	// Fast path for uncontended locks: skip the deadlock timeout timer and
-	// combine order checking with holder registration in one shard acquisition.
-	if tryLockFn != nil && tryLockFn() {
-		violations := lo.preAndPostLock(gid, ptr)
-		if violations > 0 {
-			// Roll back lock acquisition and tracking if the callback panics.
-			panicked := true
-			defer func() {
-				if panicked {
-					lo.postUnlock(ptr)
-					unlockFn()
-				}
-			}()
-			for range violations {
-				Opts.OnPotentialDeadlock()
-			}
-			panicked = false
+// handleViolations invokes Opts.OnPotentialDeadlock for each violation found
+// after a successful TryLock/TryRLock fast path, rolling back tracking and the
+// acquired lock if the callback panics.
+//
+//go:noinline
+func handleViolations(violations int, ptr unsafe.Pointer, unlockFn func()) {
+	panicked := true
+	defer func() {
+		if panicked {
+			lo.postUnlock(ptr)
+			unlockFn()
 		}
-		return
+	}()
+	for range violations {
+		Opts.OnPotentialDeadlock()
 	}
+	panicked = false
+}
 
+// lockSlow handles contended acquisitions where TryLock/TryRLock failed.
+//
+//go:noinline
+func lockSlow(lockFn func(), ptr unsafe.Pointer) {
+	gid := goid.Get()
 	var stackBuf [stackBufSize]uintptr
 	stack := stackBuf[:fpCallers(stackBuf[:])]
 

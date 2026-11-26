@@ -48,13 +48,13 @@ func (m *ChannelMutex) TryLock() bool {
 // ChannelRWMutex implements RWMutexImpl with writer priority using channels.
 // Implements writer-priority semantics using the "Third Readers-Writers Problem" solution.
 type ChannelRWMutex struct {
-	resource    chan struct{} // The actual resource being protected
-	readTry     chan struct{} // Gate that closes when writers waiting
-	rmutex      chan struct{} // Protects readCount modifications
-	wmutex      chan struct{} // Protects writeCount modifications
-	readCount   int32         // Number of active readers
-	writeCount  int32         // Number of waiting/active writers
-	once        sync.Once
+	resource   chan struct{} // The actual resource being protected
+	readTry    chan struct{} // Gate that closes when writers waiting
+	rmutex     chan struct{} // Protects readCount modifications
+	wmutex     chan struct{} // Protects writeCount modifications
+	readCount  int32         // Number of active readers
+	writeCount int32         // Number of waiting/active writers
+	once       sync.Once
 }
 
 func (m *ChannelRWMutex) init() {

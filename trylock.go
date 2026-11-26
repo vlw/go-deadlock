@@ -8,47 +8,44 @@ import (
 
 // TryLock tries to lock the mutex.
 // Returns false if the lock is already in use, true otherwise.
+// Failed attempts do not call postUnlock, avoiding corrupting another
+// goroutine's holder entry.
 func (m *Mutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
+	if !m.mu.TryLock() {
+		return false
+	}
+	if !Opts.Disable {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.Unlock)
+		}
+	}
+	return true
 }
 
 // TryLock tries to lock rw for writing.
 // Returns false if the lock is already locked for reading or writing, true otherwise.
 func (m *RWMutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
+	if !m.mu.TryLock() {
+		return false
+	}
+	if !Opts.Disable {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.Unlock)
+		}
+	}
+	return true
 }
 
 // TryRLock tries to lock rw for reading.
 // Returns false if the lock is already locked for writing, true otherwise.
 func (m *RWMutex) TryRLock() bool {
-	return trylock(m.mu.TryRLock, m.mu.RUnlock, unsafe.Pointer(m))
-}
-
-// trylock cannot block, so it skips deadlock timeout detection while still
-// checking lock ordering and recording the holder when acquisition succeeds.
-// Failed attempts do not call postUnlock, avoiding corrupting another
-// goroutine's holder entry.
-func trylock(lockFn func() bool, unlockFn func(), ptr unsafe.Pointer) bool {
-	if Opts.Disable {
-		return lockFn()
-	}
-	if !lockFn() {
+	if !m.mu.TryRLock() {
 		return false
 	}
-	gid := goid.Get()
-	violations := lo.preAndPostLock(gid, ptr)
-	if violations > 0 {
-		panicked := true
-		defer func() {
-			if panicked {
-				lo.postUnlock(ptr)
-				unlockFn()
-			}
-		}()
-		for range violations {
-			Opts.OnPotentialDeadlock()
+	if !Opts.Disable {
+		if violations := lo.preAndPostLock(goid.Get(), unsafe.Pointer(m)); violations > 0 {
+			handleViolations(violations, unsafe.Pointer(m), m.mu.RUnlock)
 		}
-		panicked = false
 	}
 	return true
 }

@@ -26,7 +26,7 @@ func isInternalLockFrame(fn string) bool {
 	}
 	suffix := fn[len(deadlockPkgPrefix)+1:]
 	switch suffix {
-	case "lock", "trylock", "lockSlow", "handleViolations",
+	case "lockSlow", "handleViolations",
 		"(*lockOrder).preAndPostLock", "(*lockOrder).preLock", "(*lockOrder).postLock",
 		"(*Mutex).Lock", "(*Mutex).TryLock",
 		"(*RWMutex).Lock", "(*RWMutex).TryLock",
