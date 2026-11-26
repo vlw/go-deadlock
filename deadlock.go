@@ -434,17 +434,19 @@ func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p inte
 	l.mu.Unlock()
 }
 
-func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
+// checkOrderLocked checks for recursive locking and lock-order inversions for
+// goroutine gid while l.mu is held. It returns the number of detected
+// violations; callers invoke Opts.OnPotentialDeadlock after releasing l.mu so
+// slow or panicking callbacks cannot stall or permanently deadlock other locks.
+func (l *lockOrder) checkOrderLocked(gid int64, stack []uintptr, p interface{}) int {
 	if Opts.DisableLockOrderDetection {
-		return
+		return 0
 	}
-	gid := goid.Get()
-	l.mu.Lock()
 	gh := l.byGid[gid]
 	if gh == nil {
-		l.mu.Unlock()
-		return
+		return 0
 	}
+	violations := 0
 	for _, h := range *gh {
 		if h.ptr == p {
 			Opts.mu.Lock()
@@ -458,8 +460,7 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 				buf.Flush()
 			}
 			Opts.mu.Unlock()
-			Opts.OnPotentialDeadlock()
-			break
+			return 1
 		}
 		if s, ok := l.order[newBeforeAfter(p, h.ptr)]; ok {
 			Opts.mu.Lock()
@@ -478,7 +479,7 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 				buf.Flush()
 			}
 			Opts.mu.Unlock()
-			Opts.OnPotentialDeadlock()
+			violations++
 		}
 		ba := newBeforeAfter(h.ptr, p)
 		if _, exists := l.order[ba]; !exists {
@@ -490,7 +491,20 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 			}
 		}
 	}
+	return violations
+}
+
+func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
+	if Opts.DisableLockOrderDetection {
+		return
+	}
+	gid := goid.Get()
+	l.mu.Lock()
+	violations := l.checkOrderLocked(gid, stack, p)
 	l.mu.Unlock()
+	for i := 0; i < violations; i++ {
+		Opts.OnPotentialDeadlock()
+	}
 }
 
 func (l *lockOrder) postUnlock(p interface{}) {
