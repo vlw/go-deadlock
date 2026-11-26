@@ -3,41 +3,52 @@
 
 package deadlock
 
+import "github.com/petermattis/goid"
+
 // TryLock tries to lock the mutex.
 // Returns false if the lock is already in use, true otherwise.
 func (m *Mutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m)
+	return trylock(m.mu.TryLock, m.mu.Unlock, m)
 }
 
 // TryLock tries to lock rw for writing.
 // Returns false if the lock is already locked for reading or writing, true otherwise.
 func (m *RWMutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m)
+	return trylock(m.mu.TryLock, m.mu.Unlock, m)
 }
 
 // TryRLock tries to lock rw for reading.
 // Returns false if the lock is already locked for writing, true otherwise.
 func (m *RWMutex) TryRLock() bool {
-	return trylock(m.mu.TryRLock, m)
+	return trylock(m.mu.TryRLock, m.mu.RUnlock, m)
 }
 
-// trylock can not deadlock, so there is no deadlock detection.
-// lock ordering is still supported by calling into preLock/postLock,
-// and in failed attempt into postUnlock to unroll the state added by preLock.
-func trylock(lockFn func() bool, ptr interface{}) bool {
+// trylock cannot block, so it skips deadlock timeout detection while still
+// checking lock ordering and recording the holder when acquisition succeeds.
+// Failed attempts do not call postUnlock, avoiding corrupting another
+// goroutine's holder entry.
+func trylock(lockFn func() bool, unlockFn func(), ptr interface{}) bool {
 	if Opts.Disable {
 		return lockFn()
 	}
-	stack, buf := callers(1)
-	preLock(stack, ptr)
-	ret := lockFn()
-	if ret {
-		postLock(stack, buf, ptr)
-	} else {
-		// TryLock failed: the stack won't be stored in stackGID.buf (postLock is
-		// skipped), so we must release the pooled buffer directly to avoid a leak.
-		releaseStackBuf(buf)
-		postUnlock(ptr)
+	if !lockFn() {
+		return false
 	}
-	return ret
+	gid := goid.Get()
+	stack, buf := callers(1)
+	violations := lo.preAndPostLock(gid, stack, buf, ptr)
+	if violations > 0 {
+		panicked := true
+		defer func() {
+			if panicked {
+				lo.postUnlock(ptr)
+				unlockFn()
+			}
+		}()
+		for i := 0; i < violations; i++ {
+			Opts.OnPotentialDeadlock()
+		}
+		panicked = false
+	}
+	return true
 }

@@ -217,3 +217,40 @@ func TestTryLockDuplicate(t *testing.T) {
 		t.Fatalf("expected 2 deadlocks, detected %d", deadlocks)
 	}
 }
+
+func TestFailedTryLockDoesNotRemoveExistingHolder(t *testing.T) {
+	defer restore()()
+	Opts.DeadlockTimeout = 0
+
+	var detected uint32
+	Opts.OnPotentialDeadlock = func() {
+		atomic.AddUint32(&detected, 1)
+	}
+
+	var a, b Mutex
+	// Record initial lock ordering b -> a.
+	b.Lock()
+	a.Lock()
+	a.Unlock()
+	b.Unlock()
+
+	// Hold a in this goroutine while another goroutine fails TryLock on a.
+	a.Lock()
+	done := make(chan bool, 1)
+	go func() {
+		done <- a.TryLock()
+	}()
+	if <-done {
+		t.Fatal("expected TryLock on held mutex to fail")
+	}
+
+	// Lock order inversion a -> b must still be detected for this goroutine;
+	// previously the failed TryLock called postUnlock(&a) and evicted our holder entry.
+	b.Lock()
+	b.Unlock()
+	a.Unlock()
+
+	if got := atomic.LoadUint32(&detected); got != 1 {
+		t.Fatalf("expected 1 order violation after failed TryLock from another goroutine, got %d", got)
+	}
+}
