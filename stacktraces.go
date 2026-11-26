@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -15,17 +16,38 @@ import (
 const stackBufSize = 50
 
 var stackBufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new([stackBufSize]uintptr)
 	},
+}
+
+var deadlockPkgPrefix = func() string {
+	name := runtime.FuncForPC(reflect.ValueOf(callers).Pointer()).Name()
+	return strings.TrimSuffix(name, ".callers")
+}()
+
+func isInternalLockFrame(fn string) bool {
+	if !strings.HasPrefix(fn, deadlockPkgPrefix+".") {
+		return false
+	}
+	suffix := fn[len(deadlockPkgPrefix)+1:]
+	switch suffix {
+	case "callers", "captureCallers", "lock", "trylock",
+		"(*Mutex).Lock", "(*Mutex).TryLock",
+		"(*RWMutex).Lock", "(*RWMutex).TryLock",
+		"(*RWMutex).RLock", "(*RWMutex).TryRLock":
+		return true
+	}
+	return false
 }
 
 // callers returns a stack trace backed by a pooled buffer. The caller must
 // eventually return buf via releaseStackBuf — typically through the
 // postLock/postUnlock path which stores it in stackGID.buf.
 func callers(skip int) ([]uintptr, *[stackBufSize]uintptr) {
+	_ = skip
 	buf := stackBufPool.Get().(*[stackBufSize]uintptr)
-	n := runtime.Callers(2+skip, buf[:])
+	n := fpCallers(buf[:])
 	return buf[:n], buf
 }
 
@@ -47,6 +69,10 @@ func copyStack(s []uintptr) []uintptr {
 }
 
 func printStack(w io.Writer, stack []uintptr) {
+	if len(stack) == 0 {
+		fmt.Fprintln(w)
+		return
+	}
 	home := os.Getenv("HOME")
 	usr, err := user.Current()
 	if err == nil {
@@ -54,9 +80,23 @@ func printStack(w io.Writer, stack []uintptr) {
 	}
 	cwd, _ := os.Getwd()
 
-	for i, pc := range stack {
-		f := runtime.FuncForPC(pc)
-		name := f.Name()
+	frames := runtime.CallersFrames(stack)
+	printed := 0
+	for {
+		frame, more := frames.Next()
+		if frame.Function == "" && frame.File == "" {
+			if !more {
+				break
+			}
+			continue
+		}
+		if printed == 0 && isInternalLockFrame(frame.Function) {
+			if !more {
+				break
+			}
+			continue
+		}
+		name := frame.Function
 		pkg := ""
 		if pos := strings.LastIndex(name, "/"); pos >= 0 {
 			name = name[pos+1:]
@@ -65,30 +105,33 @@ func printStack(w io.Writer, stack []uintptr) {
 			pkg = name[:pos]
 			name = name[pos+1:]
 		}
-		file, line := f.FileLine(pc)
 		if (pkg == "runtime" && name == "goexit") || (pkg == "testing" && name == "tRunner") {
 			fmt.Fprintln(w)
 			return
 		}
 		tail := ""
-		if i == 0 {
+		if printed == 0 {
 			tail = " <<<<<" // Make the line performing a lock prominent.
 		}
 		// Shorten the file name.
-		clean := file
+		clean := frame.File
 		if cwd != "" {
-			cl, err := filepath.Rel(cwd, file)
+			cl, err := filepath.Rel(cwd, frame.File)
 			if err == nil {
 				clean = cl
 			}
 		}
 		if home != "" {
-			s2 := strings.Replace(file, home, "~", 1)
+			s2 := strings.Replace(frame.File, home, "~", 1)
 			if len(clean) > len(s2) {
 				clean = s2
 			}
 		}
-		fmt.Fprintf(w, "%s:%d %s.%s %s%s\n", clean, line-1, pkg, name, code(file, line), tail)
+		fmt.Fprintf(w, "%s:%d %s.%s %s%s\n", clean, frame.Line, pkg, name, code(frame.File, frame.Line), tail)
+		printed++
+		if !more {
+			break
+		}
 	}
 	fmt.Fprintln(w)
 }
@@ -98,7 +141,7 @@ var fileSources struct {
 	lines map[string][][]byte
 }
 
-// Reads souce file lines from disk if not cached already.
+// Reads source file lines from disk if not cached already.
 func getSourceLines(file string) [][]byte {
 	fileSources.Lock()
 	defer fileSources.Unlock()
@@ -115,7 +158,7 @@ func getSourceLines(file string) [][]byte {
 
 func code(file string, line int) string {
 	lines := getSourceLines(file)
-	line -= 2
+	line -= 1
 	if line >= len(lines) || line < 0 {
 		return "???"
 	}
