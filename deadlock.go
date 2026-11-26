@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/petermattis/goid"
 )
@@ -379,10 +380,10 @@ func onDeadlockTimeout(e *pendingEntry) {
 }
 
 type lockOrder struct {
-	mu    sync.Mutex
-	cur   map[interface{}]*[]stackGID // stacktraces + gids for the locks currently taken.
-	byGid map[int64]*[]heldLock       // per-goroutine index of held locks for O(depth) preLock checks.
-	order map[beforeAfter]ss          // expected order of locks.
+	mu     sync.Mutex
+	cur    map[interface{}]*[]stackGID // stacktraces + gids for the locks currently taken.
+	byGid  map[int64]*[]heldLock       // per-goroutine index of held locks for O(depth) preLock checks.
+	orders orderStore                  // sharded lock-free canonical lock-order table.
 }
 
 type stackGID struct {
@@ -396,18 +397,12 @@ type heldLock struct {
 	stack []uintptr
 }
 
-type ss struct {
-	before []uintptr
-	after  []uintptr
-}
-
 var lo = newLockOrder()
 
 func newLockOrder() *lockOrder {
 	return &lockOrder{
 		cur:   map[interface{}]*[]stackGID{},
 		byGid: map[int64]*[]heldLock{},
-		order: map[beforeAfter]ss{},
 	}
 }
 
@@ -485,13 +480,18 @@ func (l *lockOrder) checkOrderLocked(gid int64, stack []uintptr, p interface{}) 
 			Opts.mu.Unlock()
 			return 1
 		}
-		if s, ok := l.order[newBeforeAfter(p, h.ptr)]; ok {
+		if before, after, violated := l.orders.checkAndRecord(
+			unsafe.Pointer(ptrFromInterface(h.ptr)),
+			unsafe.Pointer(ptrFromInterface(p)),
+			h.stack,
+			stack,
+		); violated {
 			Opts.mu.Lock()
 			fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
 			fmt.Fprintln(Opts.LogBuf, "happened before")
-			printStack(Opts.LogBuf, s.before)
+			printStack(Opts.LogBuf, before)
 			fmt.Fprintln(Opts.LogBuf, "happened after")
-			printStack(Opts.LogBuf, s.after)
+			printStack(Opts.LogBuf, after)
 			fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
 			printStack(Opts.LogBuf, h.stack)
 			fmt.Fprintln(Opts.LogBuf, "happened after")
@@ -503,15 +503,6 @@ func (l *lockOrder) checkOrderLocked(gid int64, stack []uintptr, p interface{}) 
 			}
 			Opts.mu.Unlock()
 			violations++
-		}
-		ba := newBeforeAfter(h.ptr, p)
-		if _, exists := l.order[ba]; !exists {
-			// Copy both stacks only when first recording a (before, after) pair:
-			// their backing buffers are pooled and recycled in postUnlock.
-			l.order[ba] = ss{copyStack(h.stack), copyStack(stack)}
-			if len(l.order) == Opts.MaxMapSize { // Reset the map to keep memory footprint bounded.
-				l.order = map[beforeAfter]ss{}
-			}
 		}
 	}
 	return violations
