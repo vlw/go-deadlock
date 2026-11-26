@@ -393,3 +393,33 @@ func TestLockDuplicate(t *testing.T) {
 		t.Fatalf("expected 2 deadlocks, detected %d", deadlocks)
 	}
 }
+
+func TestCrossGoroutineUnlockCleansByGid(t *testing.T) {
+	defer restore()()
+	Opts.DeadlockTimeout = 0
+
+	var detected uint32
+	Opts.OnPotentialDeadlock = func() {
+		atomic.AddUint32(&detected, 1)
+	}
+
+	var a, b Mutex
+	done := make(chan struct{})
+	a.Lock()
+	go func() {
+		a.Unlock()
+		close(done)
+	}()
+	<-done
+
+	// After a cross-goroutine unlock, re-locking a and nesting a -> b must not
+	// report a false recursive lock.
+	a.Lock()
+	b.Lock()
+	b.Unlock()
+	a.Unlock()
+
+	if got := atomic.LoadUint32(&detected); got != 0 {
+		t.Fatalf("expected 0 false deadlocks after cross-goroutine unlock, got %d", got)
+	}
+}

@@ -361,6 +361,7 @@ func onDeadlockTimeout(e *pendingEntry) {
 type lockOrder struct {
 	mu    sync.Mutex
 	cur   map[interface{}]*[]stackGID // stacktraces + gids for the locks currently taken.
+	byGid map[int64]*[]heldLock       // per-goroutine index of held locks for O(depth) preLock checks.
 	order map[beforeAfter]ss          // expected order of locks.
 }
 
@@ -368,6 +369,11 @@ type stackGID struct {
 	stack []uintptr
 	gid   int64
 	buf   *[stackBufSize]uintptr // pooled backing array; returned via releaseStackBuf in postUnlock
+}
+
+type heldLock struct {
+	ptr   interface{}
+	stack []uintptr
 }
 
 type ss struct {
@@ -380,6 +386,7 @@ var lo = newLockOrder()
 func newLockOrder() *lockOrder {
 	return &lockOrder{
 		cur:   map[interface{}]*[]stackGID{},
+		byGid: map[int64]*[]heldLock{},
 		order: map[beforeAfter]ss{},
 	}
 }
@@ -394,9 +401,17 @@ var holdersPool = sync.Pool{
 	},
 }
 
-// postLock records the current goroutine as a holder of lock p. It reuses a
-// pooled *[]stackGID slice pointer before allocating, and stores the pooled
-// stack buffer in the entry so postUnlock can release it later.
+// heldPool recycles *[]heldLock slice pointers used by lockOrder.byGid.
+var heldPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]heldLock, 0, 2)
+		return &s
+	},
+}
+
+// postLock records the current goroutine as a holder of lock p. It reuses
+// pooled slice pointers before allocating, and stores the pooled stack buffer
+// in the entry so postUnlock can release it later.
 func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
 	gid := goid.Get()
 	entry := stackGID{stack, gid, buf}
@@ -408,6 +423,14 @@ func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p inte
 		l.cur[p] = hp
 	}
 	*hp = append(*hp, entry)
+
+	gh := l.byGid[gid]
+	if gh == nil {
+		gh = heldPool.Get().(*[]heldLock)
+		*gh = (*gh)[:0]
+		l.byGid[gid] = gh
+	}
+	*gh = append(*gh, heldLock{ptr: p, stack: stack})
 	l.mu.Unlock()
 }
 
@@ -417,57 +440,51 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 	}
 	gid := goid.Get()
 	l.mu.Lock()
-	for b, hp := range l.cur {
-		if hp == nil {
-			continue
+	gh := l.byGid[gid]
+	if gh == nil {
+		l.mu.Unlock()
+		return
+	}
+	for _, h := range *gh {
+		if h.ptr == p {
+			Opts.mu.Lock()
+			fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
+			fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %p\n", gid, h.ptr)
+			printStack(Opts.LogBuf, stack)
+			fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
+			printStack(Opts.LogBuf, h.stack)
+			l.other(p)
+			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+				buf.Flush()
+			}
+			Opts.mu.Unlock()
+			Opts.OnPotentialDeadlock()
+			break
 		}
-		holders := *hp
-		if b == p {
-			for _, bs := range holders {
-				if bs.gid == gid {
-					Opts.mu.Lock()
-					fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
-					fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %p\n", gid, b)
-					printStack(Opts.LogBuf, stack)
-					fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
-					printStack(Opts.LogBuf, bs.stack)
-					l.other(p)
-					if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-						buf.Flush()
-					}
-					Opts.mu.Unlock()
-					Opts.OnPotentialDeadlock()
-					break
-				}
+		if s, ok := l.order[newBeforeAfter(p, h.ptr)]; ok {
+			Opts.mu.Lock()
+			fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
+			fmt.Fprintln(Opts.LogBuf, "happened before")
+			printStack(Opts.LogBuf, s.before)
+			fmt.Fprintln(Opts.LogBuf, "happened after")
+			printStack(Opts.LogBuf, s.after)
+			fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
+			printStack(Opts.LogBuf, h.stack)
+			fmt.Fprintln(Opts.LogBuf, "happened after")
+			printStack(Opts.LogBuf, stack)
+			l.other(p)
+			fmt.Fprintln(Opts.LogBuf)
+			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+				buf.Flush()
 			}
-			continue
+			Opts.mu.Unlock()
+			Opts.OnPotentialDeadlock()
 		}
-		for _, bs := range holders {
-			if bs.gid != gid { // We want locks taken in the same goroutine only.
-				continue
-			}
-			if s, ok := l.order[newBeforeAfter(p, b)]; ok {
-				Opts.mu.Lock()
-				fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
-				fmt.Fprintln(Opts.LogBuf, "happened before")
-				printStack(Opts.LogBuf, s.before)
-				fmt.Fprintln(Opts.LogBuf, "happened after")
-				printStack(Opts.LogBuf, s.after)
-				fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
-				printStack(Opts.LogBuf, bs.stack)
-				fmt.Fprintln(Opts.LogBuf, "happened after")
-				printStack(Opts.LogBuf, stack)
-				l.other(p)
-				fmt.Fprintln(Opts.LogBuf)
-				if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-					buf.Flush()
-				}
-				Opts.mu.Unlock()
-				Opts.OnPotentialDeadlock()
-			}
-			// Copy both stacks: they're backed by pooled buffers that will be
-			// recycled in postUnlock, but l.order entries persist until MaxMapSize.
-			l.order[newBeforeAfter(b, p)] = ss{copyStack(bs.stack), copyStack(stack)}
+		ba := newBeforeAfter(h.ptr, p)
+		if _, exists := l.order[ba]; !exists {
+			// Copy both stacks only when first recording a (before, after) pair:
+			// their backing buffers are pooled and recycled in postUnlock.
+			l.order[ba] = ss{copyStack(h.stack), copyStack(stack)}
 			if len(l.order) == Opts.MaxMapSize { // Reset the map to keep memory footprint bounded.
 				l.order = map[beforeAfter]ss{}
 			}
@@ -492,6 +509,7 @@ func (l *lockOrder) postUnlock(p interface{}) {
 			break
 		}
 	}
+	ownerGID := gid
 	if idx >= 0 {
 		removedBuf := holders[idx].buf
 		holders[idx] = holders[len(holders)-1]
@@ -508,10 +526,14 @@ func (l *lockOrder) postUnlock(p interface{}) {
 		// concurrent readers we may discard the wrong reader's stack trace, making a
 		// future deadlock report show a slightly misleading "previous lock site".
 		// Detection correctness is unaffected.
-		removedBuf := holders[len(holders)-1].buf
-		holders[len(holders)-1] = stackGID{}
-		holders = holders[:len(holders)-1]
+		last := len(holders) - 1
+		ownerGID = holders[last].gid
+		removedBuf := holders[last].buf
+		holders[last] = stackGID{}
+		holders = holders[:last]
 		releaseStackBuf(removedBuf)
+	} else {
+		ownerGID = -1
 	}
 	if len(holders) == 0 {
 		// Delete the map key so the mutex pointer is not retained, allowing GC of
@@ -522,6 +544,26 @@ func (l *lockOrder) postUnlock(p interface{}) {
 		holdersPool.Put(hp)
 	} else {
 		*hp = holders
+	}
+	if ownerGID >= 0 {
+		if gh := l.byGid[ownerGID]; gh != nil {
+			held := *gh
+			for i := len(held) - 1; i >= 0; i-- {
+				if held[i].ptr == p {
+					held[i] = held[len(held)-1]
+					held[len(held)-1] = heldLock{}
+					held = held[:len(held)-1]
+					break
+				}
+			}
+			if len(held) == 0 {
+				*gh = held[:0]
+				delete(l.byGid, ownerGID)
+				heldPool.Put(gh)
+			} else {
+				*gh = held
+			}
+		}
 	}
 	l.mu.Unlock()
 }
