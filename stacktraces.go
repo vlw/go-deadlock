@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -109,7 +108,7 @@ func getSourceLines(file string) [][]byte {
 	if lines, ok := fileSources.lines[file]; ok {
 		return lines
 	}
-	text, _ := ioutil.ReadFile(file)
+	text, _ := os.ReadFile(file)
 	fileSources.lines[file] = bytes.Split(text, []byte{'\n'})
 	return fileSources.lines[file]
 }

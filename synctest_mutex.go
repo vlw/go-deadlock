@@ -7,8 +7,6 @@ import (
 	"sync/atomic"
 )
 
-const hasTryLock = true
-
 // ChannelMutex implements MutexImpl using channels for synctest compatibility
 type ChannelMutex struct {
 	ch     chan struct{}

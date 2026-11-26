@@ -1,10 +1,8 @@
-//go:build deadlock_disable && !go1.18
+//go:build deadlock_disable
 
 package deadlock
 
 import "sync"
-
-const hasTryLock = false
 
 // StandardMutex wraps sync.Mutex with no deadlock detection
 type StandardMutex struct {
@@ -20,7 +18,7 @@ func (m *StandardMutex) Unlock() {
 }
 
 func (m *StandardMutex) TryLock() bool {
-	panic("TryLock requires Go 1.18 or later")
+	return m.mu.TryLock()
 }
 
 // StandardRWMutex wraps sync.RWMutex with no deadlock detection
@@ -45,11 +43,11 @@ func (m *StandardRWMutex) RUnlock() {
 }
 
 func (m *StandardRWMutex) TryLock() bool {
-	panic("TryLock requires Go 1.18 or later")
+	return m.mu.TryLock()
 }
 
 func (m *StandardRWMutex) TryRLock() bool {
-	panic("TryRLock requires Go 1.18 or later")
+	return m.mu.TryRLock()
 }
 
 func (m *StandardRWMutex) RLocker() sync.Locker {

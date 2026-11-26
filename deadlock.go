@@ -198,7 +198,7 @@ func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}
 
 	// Fast path for uncontended locks: skip the deadlock timeout timer and
 	// combine order checking with holder registration under a single lo.mu lock.
-	if hasTryLock && tryLockFn != nil && tryLockFn() {
+	if tryLockFn != nil && tryLockFn() {
 		violations := lo.preAndPostLock(gid, stack, buf, ptr)
 		if violations > 0 {
 			// Roll back lock acquisition and tracking if the callback panics.

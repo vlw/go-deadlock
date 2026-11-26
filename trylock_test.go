@@ -1,6 +1,3 @@
-//go:build go1.18
-// +build go1.18
-
 package deadlock
 
 import (
@@ -197,7 +194,8 @@ func TestTryLockDuplicate(t *testing.T) {
 	var b Mutex
 	go func() {
 		if !a.TryRLock() {
-			t.Fatal("expected TryRLock to succeed, it failed")
+			t.Error("expected TryRLock to succeed, it failed")
+			return
 		}
 		a.Lock()
 		a.RUnlock()
@@ -205,7 +203,8 @@ func TestTryLockDuplicate(t *testing.T) {
 	}()
 	go func() {
 		if !b.TryLock() {
-			t.Fatal("expected TryLock to succeed, it failed")
+			t.Error("expected TryLock to succeed, it failed")
+			return
 		}
 		b.Lock()
 		b.Unlock()
