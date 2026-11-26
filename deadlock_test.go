@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func TestNoDeadlocks(t *testing.T) {
@@ -339,7 +340,7 @@ func TestDeadlockTimeoutTransientNoHolder(t *testing.T) {
 	// Build a pendingEntry as if a goroutine were blocked waiting on mu.
 	// mu has never been locked, so lo.cur has no holders for it.
 	e := newPendingEntry()
-	e.ptr = &mu
+	e.ptr = unsafe.Pointer(&mu)
 	e.gid = 999
 	atomic.StoreInt32(&e.done, 0)
 
@@ -421,5 +422,37 @@ func TestCrossGoroutineUnlockCleansByGid(t *testing.T) {
 
 	if got := atomic.LoadUint32(&detected); got != 0 {
 		t.Fatalf("expected 0 false deadlocks after cross-goroutine unlock, got %d", got)
+	}
+}
+
+func TestDeepNestedOverflowLockOrder(t *testing.T) {
+	defer restore()()
+	Opts.DeadlockTimeout = 0
+
+	var detected uint32
+	Opts.OnPotentialDeadlock = func() {
+		atomic.AddUint32(&detected, 1)
+	}
+
+	// Hold 8 nested locks (> gidInlineSlots = 4) to exercise shard overflow slots.
+	var ms [8]Mutex
+	for i := range ms {
+		ms[i].Lock()
+	}
+	for i := len(ms) - 1; i >= 0; i-- {
+		ms[i].Unlock()
+	}
+	if got := atomic.LoadUint32(&detected); got != 0 {
+		t.Fatalf("expected 0 deadlocks for consistent deep nesting, got %d", got)
+	}
+
+	// Violate order between an overflow-slot mutex (7) and an inline-slot mutex (0).
+	ms[7].Lock()
+	ms[0].Lock()
+	ms[0].Unlock()
+	ms[7].Unlock()
+
+	if got := atomic.LoadUint32(&detected); got != 1 {
+		t.Fatalf("expected 1 deadlock on inverted deep-nested pair, got %d", got)
 	}
 }

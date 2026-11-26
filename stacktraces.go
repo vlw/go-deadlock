@@ -15,15 +15,9 @@ import (
 
 const stackBufSize = 50
 
-var stackBufPool = sync.Pool{
-	New: func() any {
-		return new([stackBufSize]uintptr)
-	},
-}
-
 var deadlockPkgPrefix = func() string {
-	name := runtime.FuncForPC(reflect.ValueOf(callers).Pointer()).Name()
-	return strings.TrimSuffix(name, ".callers")
+	name := runtime.FuncForPC(reflect.ValueOf(copyStack).Pointer()).Name()
+	return strings.TrimSuffix(name, ".copyStack")
 }()
 
 func isInternalLockFrame(fn string) bool {
@@ -32,7 +26,8 @@ func isInternalLockFrame(fn string) bool {
 	}
 	suffix := fn[len(deadlockPkgPrefix)+1:]
 	switch suffix {
-	case "callers", "captureCallers", "lock", "trylock",
+	case "lock", "trylock", "lockSlow", "handleViolations",
+		"(*lockOrder).preAndPostLock", "(*lockOrder).preLock", "(*lockOrder).postLock",
 		"(*Mutex).Lock", "(*Mutex).TryLock",
 		"(*RWMutex).Lock", "(*RWMutex).TryLock",
 		"(*RWMutex).RLock", "(*RWMutex).TryRLock":
@@ -41,27 +36,8 @@ func isInternalLockFrame(fn string) bool {
 	return false
 }
 
-// callers returns a stack trace backed by a pooled buffer. The caller must
-// eventually return buf via releaseStackBuf — typically through the
-// postLock/postUnlock path which stores it in stackGID.buf.
-func callers(skip int) ([]uintptr, *[stackBufSize]uintptr) {
-	_ = skip
-	buf := stackBufPool.Get().(*[stackBufSize]uintptr)
-	n := fpCallers(buf[:])
-	return buf[:n], buf
-}
-
-// releaseStackBuf returns a pooled stack buffer obtained from callers(). Safe to
-// call with nil (e.g. when the buffer was already handed off via stackGID.buf).
-func releaseStackBuf(buf *[stackBufSize]uintptr) {
-	if buf != nil {
-		stackBufPool.Put(buf)
-	}
-}
-
-// copyStack creates an independent copy of a stack trace. Required when storing
-// stacks in long-lived structures (e.g. l.order) because the originals are backed
-// by pooled buffers that will be recycled in postUnlock.
+// copyStack creates an independent copy of a stack trace for long-lived storage
+// (e.g. orderEntry or deadlock violation reports).
 func copyStack(s []uintptr) []uintptr {
 	c := make([]uintptr, len(s))
 	copy(c, s)

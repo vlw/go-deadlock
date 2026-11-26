@@ -64,15 +64,6 @@ func hashPair(a, b uintptr) uint64 {
 	return x ^ (x >> 31)
 }
 
-// ptrFromInterface extracts the data pointer from an interface{} value.
-func ptrFromInterface(i any) *byte {
-	type eface struct {
-		_    uintptr
-		data unsafe.Pointer
-	}
-	return (*byte)((*eface)(unsafe.Pointer(&i)).data)
-}
-
 func (os *orderStore) reset() {
 	for i := range os.shards {
 		sh := &os.shards[i]

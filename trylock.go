@@ -1,30 +1,34 @@
 package deadlock
 
-import "github.com/petermattis/goid"
+import (
+	"unsafe"
+
+	"github.com/petermattis/goid"
+)
 
 // TryLock tries to lock the mutex.
 // Returns false if the lock is already in use, true otherwise.
 func (m *Mutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m.mu.Unlock, m)
+	return trylock(m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
 }
 
 // TryLock tries to lock rw for writing.
 // Returns false if the lock is already locked for reading or writing, true otherwise.
 func (m *RWMutex) TryLock() bool {
-	return trylock(m.mu.TryLock, m.mu.Unlock, m)
+	return trylock(m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
 }
 
 // TryRLock tries to lock rw for reading.
 // Returns false if the lock is already locked for writing, true otherwise.
 func (m *RWMutex) TryRLock() bool {
-	return trylock(m.mu.TryRLock, m.mu.RUnlock, m)
+	return trylock(m.mu.TryRLock, m.mu.RUnlock, unsafe.Pointer(m))
 }
 
 // trylock cannot block, so it skips deadlock timeout detection while still
 // checking lock ordering and recording the holder when acquisition succeeds.
 // Failed attempts do not call postUnlock, avoiding corrupting another
 // goroutine's holder entry.
-func trylock(lockFn func() bool, unlockFn func(), ptr interface{}) bool {
+func trylock(lockFn func() bool, unlockFn func(), ptr unsafe.Pointer) bool {
 	if Opts.Disable {
 		return lockFn()
 	}
@@ -32,8 +36,7 @@ func trylock(lockFn func() bool, unlockFn func(), ptr interface{}) bool {
 		return false
 	}
 	gid := goid.Get()
-	stack, buf := callers(1)
-	violations := lo.preAndPostLock(gid, stack, buf, ptr)
+	violations := lo.preAndPostLock(gid, ptr)
 	if violations > 0 {
 		panicked := true
 		defer func() {
@@ -42,7 +45,7 @@ func trylock(lockFn func() bool, unlockFn func(), ptr interface{}) bool {
 				unlockFn()
 			}
 		}()
-		for i := 0; i < violations; i++ {
+		for range violations {
 			Opts.OnPotentialDeadlock()
 		}
 		panicked = false

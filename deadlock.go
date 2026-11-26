@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/bits"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -104,7 +105,7 @@ type Mutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *Mutex) Lock() {
-	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, m)
+	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
 }
 
 // Unlock unlocks the mutex.
@@ -114,10 +115,10 @@ func (m *Mutex) Lock() {
 // It is allowed for one goroutine to lock a Mutex and then
 // arrange for another goroutine to unlock it.
 func (m *Mutex) Unlock() {
-	m.mu.Unlock()
 	if !Opts.Disable {
-		postUnlock(m)
+		lo.postUnlock(unsafe.Pointer(m))
 	}
+	m.mu.Unlock()
 }
 
 // An RWMutex is a drop-in replacement for sync.RWMutex.
@@ -136,7 +137,7 @@ type RWMutex struct {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) Lock() {
-	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, m)
+	lock(m.mu.Lock, m.mu.TryLock, m.mu.Unlock, unsafe.Pointer(m))
 }
 
 // Unlock unlocks the mutex for writing.  It is a run-time error if rw is
@@ -146,10 +147,10 @@ func (m *RWMutex) Lock() {
 // goroutine.  One goroutine may RLock (Lock) an RWMutex and then
 // arrange for another goroutine to RUnlock (Unlock) it.
 func (m *RWMutex) Unlock() {
-	m.mu.Unlock()
 	if !Opts.Disable {
-		postUnlock(m)
+		lo.postUnlock(unsafe.Pointer(m))
 	}
+	m.mu.Unlock()
 }
 
 // RLock locks the mutex for reading.
@@ -157,7 +158,7 @@ func (m *RWMutex) Unlock() {
 // Unless deadlock detection is disabled, logs potential deadlocks to Opts.LogBuf,
 // calling Opts.OnPotentialDeadlock on each occasion.
 func (m *RWMutex) RLock() {
-	lock(m.mu.RLock, m.mu.TryRLock, m.mu.RUnlock, m)
+	lock(m.mu.RLock, m.mu.TryRLock, m.mu.RUnlock, unsafe.Pointer(m))
 }
 
 // RUnlock undoes a single RLock call;
@@ -165,10 +166,10 @@ func (m *RWMutex) RLock() {
 // It is a run-time error if rw is not locked for reading
 // on entry to RUnlock.
 func (m *RWMutex) RUnlock() {
-	m.mu.RUnlock()
 	if !Opts.Disable {
-		postUnlock(m)
+		lo.postUnlock(unsafe.Pointer(m))
 	}
+	m.mu.RUnlock()
 }
 
 // RLocker returns a Locker interface that implements
@@ -177,30 +178,17 @@ func (m *RWMutex) RLocker() sync.Locker {
 	return m.mu.RLocker()
 }
 
-func preLock(stack []uintptr, p interface{}) {
-	lo.preLock(goid.Get(), stack, p)
-}
-
-func postLock(stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
-	lo.postLock(goid.Get(), stack, buf, p)
-}
-
-func postUnlock(p interface{}) {
-	lo.postUnlock(p)
-}
-
-func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}) {
+func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr unsafe.Pointer) {
 	if Opts.Disable {
 		lockFn()
 		return
 	}
 	gid := goid.Get()
-	stack, buf := callers(1)
 
 	// Fast path for uncontended locks: skip the deadlock timeout timer and
-	// combine order checking with holder registration under a single lo.mu lock.
+	// combine order checking with holder registration in one shard acquisition.
 	if tryLockFn != nil && tryLockFn() {
-		violations := lo.preAndPostLock(gid, stack, buf, ptr)
+		violations := lo.preAndPostLock(gid, ptr)
 		if violations > 0 {
 			// Roll back lock acquisition and tracking if the callback panics.
 			panicked := true
@@ -210,13 +198,16 @@ func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}
 					unlockFn()
 				}
 			}()
-			for i := 0; i < violations; i++ {
+			for range violations {
 				Opts.OnPotentialDeadlock()
 			}
 			panicked = false
 		}
 		return
 	}
+
+	var stackBuf [stackBufSize]uintptr
+	stack := stackBuf[:fpCallers(stackBuf[:])]
 
 	// Cache timeout before preLock so all Opts reads complete before preLock
 	// may call OnPotentialDeadlock. If preLock detects a problem (recursive
@@ -231,11 +222,13 @@ func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}
 		lockFn()
 		dw.deregister(e)
 	}
-	lo.postLock(gid, stack, buf, ptr)
+	lo.postLock(gid, stack, ptr)
 }
 
 // pendingEntry tracks a goroutine that is waiting to acquire a lock. Entries are
 // pooled to avoid per-lock heap allocations (goroutine stacks, channels, closures).
+// The waiting stack is copied inline into stack so onDeadlockTimeout never
+// aliases a caller-owned buffer.
 //
 // Timer safety invariants:
 //   - checkFn is allocated once per entry and reused across pool cycles, so recycling
@@ -250,12 +243,13 @@ func lock(lockFn func(), tryLockFn func() bool, unlockFn func(), ptr interface{}
 //   - When Stop() returns false (callback already firing or queued), the entry is
 //     intentionally leaked to GC. This only happens in the rare deadlock-timeout path.
 type pendingEntry struct {
-	stack   []uintptr
-	ptr     interface{}
-	gid     int64
-	done    int32 // atomic: 0=pending, 1=acquired
-	timer   *time.Timer
-	checkFn func()
+	stack    [stackBufSize]uintptr
+	stackLen int
+	ptr      unsafe.Pointer
+	gid      int64
+	done     int32 // atomic: 0=pending, 1=acquired
+	timer    *time.Timer
+	checkFn  func()
 }
 
 func newPendingEntry() *pendingEntry {
@@ -274,7 +268,7 @@ func newPendingEntry() *pendingEntry {
 }
 
 var pendingPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return newPendingEntry()
 	},
 }
@@ -283,14 +277,14 @@ type deadlockWatcher struct{}
 
 var dw deadlockWatcher
 
-func (w *deadlockWatcher) register(stack []uintptr, ptr interface{}, gid int64, timeout time.Duration) *pendingEntry {
+func (w *deadlockWatcher) register(stack []uintptr, ptr unsafe.Pointer, gid int64, timeout time.Duration) *pendingEntry {
 	var e *pendingEntry
 	if shouldDisableTimerPool() {
 		e = newPendingEntry()
 	} else {
 		e = pendingPool.Get().(*pendingEntry)
 	}
-	e.stack = stack
+	e.stackLen = copy(e.stack[:], stack)
 	e.ptr = ptr
 	e.gid = gid
 	atomic.StoreInt32(&e.done, 0)
@@ -320,30 +314,33 @@ func (w *deadlockWatcher) deregister(e *pendingEntry) {
 	// If Stop() returned false the callback is already executing or queued;
 	// recycling would race with the callback reading entry fields.
 	if stopped && !shouldDisableTimerPool() {
-		e.stack = nil
+		e.stackLen = 0
 		e.ptr = nil
 		e.gid = 0
 		pendingPool.Put(e)
 	}
 }
 
+type holderSnapshot struct {
+	gid   int64
+	ptr   unsafe.Pointer
+	stack []uintptr
+}
+
 func onDeadlockTimeout(e *pendingEntry) {
-	lo.mu.Lock()
-	holdersPtr, ok := lo.cur[e.ptr]
-	if !ok || holdersPtr == nil || len(*holdersPtr) == 0 {
+	holders := lo.snapshotHolders(e.ptr)
+	if len(holders) == 0 {
 		// Lock appears unheld (transient state, holder may have just released).
 		// Reschedule if the waiter is still pending. Note: this creates a new timer
 		// (e.timer is not updated), so if deregister runs later it will Stop() the
 		// original (already-fired) timer, get false, and skip pooling. The new timer's
 		// callback will then observe done=1 and no-op. This is safe but means the
 		// entry won't be recycled, acceptable since this is the rare timeout path.
-		lo.mu.Unlock()
 		if atomic.LoadInt32(&e.done) == 0 {
 			time.AfterFunc(Opts.DeadlockTimeout, e.checkFn)
 		}
 		return
 	}
-	holders := *holdersPtr
 	Opts.mu.Lock()
 	fmt.Fprintln(Opts.LogBuf, header)
 	for _, prev := range holders {
@@ -353,7 +350,7 @@ func onDeadlockTimeout(e *pendingEntry) {
 	}
 	fmt.Fprintln(Opts.LogBuf, "Have been trying to lock it again for more than", Opts.DeadlockTimeout)
 	fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", e.gid, e.ptr)
-	printStack(Opts.LogBuf, e.stack)
+	printStack(Opts.LogBuf, e.stack[:e.stackLen])
 	stacks := stacks()
 	grs := bytes.Split(stacks, []byte("\n\n"))
 	for _, prev := range holders {
@@ -375,260 +372,414 @@ func onDeadlockTimeout(e *pendingEntry) {
 		buf.Flush()
 	}
 	Opts.mu.Unlock()
-	lo.mu.Unlock()
 	Opts.OnPotentialDeadlock()
 }
 
+const (
+	gidShardCount  = 256
+	gidShardMask   = gidShardCount - 1
+	gidInlineSlots = 4
+	gidFullMask    = (1 << gidInlineSlots) - 1
+)
+
+// heldSlot stores a single active lock acquisition owned by gid.
+// Stack frames are kept inline so lock/unlock requires no pools or heap allocations.
+type heldSlot struct {
+	gid      int64
+	ptr      unsafe.Pointer
+	stackLen uint8
+	stack    [stackBufSize]uintptr
+}
+
+type gidShardBody struct {
+	mu       sync.Mutex
+	mask     uint8 // bit i is set iff inline[i] is occupied
+	inline   [gidInlineSlots]heldSlot
+	overflow []heldSlot
+}
+
+type gidShard struct {
+	gidShardBody
+	_ [(cacheLinePad - unsafe.Sizeof(gidShardBody{})%cacheLinePad) % cacheLinePad]byte
+}
+
+// lockOrder tracks live lock ownership in 256 goroutine-ID shards and historical
+// lock-ordering edges in a lock-free sharded table.
+//
+// Lock ordering hierarchy (strict DAG, never violated):
+//   - gidShard.mu -> orderShard.mu (one gidShard.mu at a time)
+//   - Opts.mu -> gidShard.mu (one gidShard.mu at a time, inside other/timeout reporting)
+//
+// No function ever acquires two gidShard.mu locks simultaneously, nor acquires
+// Opts.mu while holding any gidShard.mu.
 type lockOrder struct {
-	mu     sync.Mutex
-	cur    map[interface{}]*[]stackGID // stacktraces + gids for the locks currently taken.
-	byGid  map[int64]*[]heldLock       // per-goroutine index of held locks for O(depth) preLock checks.
-	orders orderStore                  // sharded lock-free canonical lock-order table.
+	shards [gidShardCount]gidShard
+	orders orderStore
 }
 
-type stackGID struct {
-	stack []uintptr
-	gid   int64
-	buf   *[stackBufSize]uintptr // pooled backing array; returned via releaseStackBuf in postUnlock
+var lo lockOrder
+
+func hashGid(gid int64) uint64 {
+	return (uint64(gid) * 0x9e3779b97f4a7c15) >> 56
 }
 
-type heldLock struct {
-	ptr   interface{}
-	stack []uintptr
+type orderViolation struct {
+	prevBefore []uintptr
+	prevAfter  []uintptr
+	curBefore  []uintptr
+	curAfter   []uintptr
 }
 
-var lo = newLockOrder()
+// preAndPostLock checks lock ordering and registers the acquisition in a single
+// shard lock acquisition for the TryLock/TryRLock fast path.
+func (l *lockOrder) preAndPostLock(gid int64, ptr unsafe.Pointer) int {
+	sh := &l.shards[hashGid(gid)]
+	sh.mu.Lock()
 
-func newLockOrder() *lockOrder {
-	return &lockOrder{
-		cur:   map[interface{}]*[]stackGID{},
-		byGid: map[int64]*[]heldLock{},
-	}
-}
-
-// holdersPool recycles *[]stackGID slice pointers used by lockOrder.cur to track
-// which goroutines currently hold each lock. Storing pointers rather than slice
-// values avoids a 24-byte interface boxing allocation on every sync.Pool.Put.
-var holdersPool = sync.Pool{
-	New: func() interface{} {
-		s := make([]stackGID, 0, 1)
-		return &s
-	},
-}
-
-// heldPool recycles *[]heldLock slice pointers used by lockOrder.byGid.
-var heldPool = sync.Pool{
-	New: func() interface{} {
-		s := make([]heldLock, 0, 2)
-		return &s
-	},
-}
-
-// postLockLocked records gid as a holder of lock p while l.mu is held.
-func (l *lockOrder) postLockLocked(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
-	hp := l.cur[p]
-	if hp == nil {
-		hp = holdersPool.Get().(*[]stackGID)
-		*hp = (*hp)[:0]
-		l.cur[p] = hp
-	}
-	*hp = append(*hp, stackGID{stack, gid, buf})
-
-	gh := l.byGid[gid]
-	if gh == nil {
-		gh = heldPool.Get().(*[]heldLock)
-		*gh = (*gh)[:0]
-		l.byGid[gid] = gh
-	}
-	*gh = append(*gh, heldLock{ptr: p, stack: stack})
-}
-
-// postLock records gid as a holder of lock p. It reuses pooled slice pointers
-// before allocating, and stores the pooled stack buffer in the entry so
-// postUnlock can release it later.
-func (l *lockOrder) postLock(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
-	l.mu.Lock()
-	l.postLockLocked(gid, stack, buf, p)
-	l.mu.Unlock()
-}
-
-// checkOrderLocked checks for recursive locking and lock-order inversions for
-// goroutine gid while l.mu is held. It returns the number of detected
-// violations; callers invoke Opts.OnPotentialDeadlock after releasing l.mu so
-// slow or panicking callbacks cannot stall or permanently deadlock other locks.
-func (l *lockOrder) checkOrderLocked(gid int64, stack []uintptr, p interface{}) int {
-	if Opts.DisableLockOrderDetection {
+	// Fast path: shard is completely empty (common single-lock case).
+	if sh.mask == 0 && len(sh.overflow) == 0 {
+		slot := &sh.inline[0]
+		slot.gid = gid
+		slot.ptr = ptr
+		slot.stackLen = uint8(fpCallers(slot.stack[:]))
+		sh.mask = 1
+		sh.mu.Unlock()
 		return 0
 	}
-	gh := l.byGid[gid]
-	if gh == nil {
+
+	// Reserve a slot for the new acquisition and capture its stack directly into it.
+	oldMask := sh.mask
+	oldOverflowLen := len(sh.overflow)
+	var newSlot *heldSlot
+	var newInlineBit uint8
+	if oldMask != gidFullMask {
+		idx := bits.TrailingZeros8(^oldMask)
+		newInlineBit = uint8(1) << idx
+		newSlot = &sh.inline[idx]
+	} else {
+		sh.overflow = append(sh.overflow, heldSlot{})
+		newSlot = &sh.overflow[oldOverflowLen]
+	}
+	newSlot.gid = gid
+	newSlot.ptr = ptr
+	newSlot.stackLen = uint8(fpCallers(newSlot.stack[:]))
+	curStack := newSlot.stack[:newSlot.stackLen]
+
+	var recursivePrev []uintptr
+	var recursiveCur []uintptr
+	var violations []orderViolation
+
+	if !Opts.DisableLockOrderDetection {
+		recursivePrev, recursiveCur, violations = l.checkShardLocked(sh, oldMask, oldOverflowLen, gid, curStack, ptr)
+	}
+
+	if newInlineBit != 0 {
+		sh.mask = oldMask | newInlineBit
+	}
+	sh.mu.Unlock()
+
+	return l.reportViolations(gid, ptr, recursivePrev, recursiveCur, violations)
+}
+
+// checkShardLocked checks the calling goroutine's previously held locks inside sh
+// (restricted to oldMask and sh.overflow[:oldOverflowLen]) against a new acquisition
+// of ptr. Any violation stacks are copied out so reporting runs after sh.mu is released.
+func (l *lockOrder) checkShardLocked(
+	sh *gidShard,
+	oldMask uint8,
+	oldOverflowLen int,
+	gid int64,
+	curStack []uintptr,
+	ptr unsafe.Pointer,
+) (recursivePrev, recursiveCur []uintptr, violations []orderViolation) {
+	for m := oldMask; m != 0; m &= m - 1 {
+		h := &sh.inline[bits.TrailingZeros8(m)]
+		if h.gid != gid {
+			continue
+		}
+		if h.ptr == ptr {
+			return copyStack(h.stack[:h.stackLen]), copyStack(curStack), nil
+		}
+		if before, after, violated := l.orders.checkAndRecord(h.ptr, ptr, h.stack[:h.stackLen], curStack); violated {
+			violations = append(violations, orderViolation{
+				prevBefore: before,
+				prevAfter:  after,
+				curBefore:  copyStack(h.stack[:h.stackLen]),
+				curAfter:   copyStack(curStack),
+			})
+		}
+	}
+	for i := range oldOverflowLen {
+		h := &sh.overflow[i]
+		if h.gid != gid {
+			continue
+		}
+		if h.ptr == ptr {
+			return copyStack(h.stack[:h.stackLen]), copyStack(curStack), nil
+		}
+		if before, after, violated := l.orders.checkAndRecord(h.ptr, ptr, h.stack[:h.stackLen], curStack); violated {
+			violations = append(violations, orderViolation{
+				prevBefore: before,
+				prevAfter:  after,
+				curBefore:  copyStack(h.stack[:h.stackLen]),
+				curAfter:   copyStack(curStack),
+			})
+		}
+	}
+	return nil, nil, violations
+}
+
+// reportViolations logs any detected recursive locking or lock-order violations
+// under Opts.mu (with no gidShard.mu held) and returns the violation count.
+func (l *lockOrder) reportViolations(
+	gid int64,
+	ptr unsafe.Pointer,
+	recursivePrev, recursiveCur []uintptr,
+	violations []orderViolation,
+) int {
+	if recursivePrev != nil {
+		Opts.mu.Lock()
+		fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
+		fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %p\n", gid, ptr)
+		printStack(Opts.LogBuf, recursiveCur)
+		fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
+		printStack(Opts.LogBuf, recursivePrev)
+		l.other(ptr)
+		if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+			buf.Flush()
+		}
+		Opts.mu.Unlock()
+		return 1
+	}
+	if len(violations) == 0 {
 		return 0
 	}
-	violations := 0
-	for _, h := range *gh {
-		if h.ptr == p {
-			Opts.mu.Lock()
-			fmt.Fprintln(Opts.LogBuf, header, "Recursive locking:")
-			fmt.Fprintf(Opts.LogBuf, "current goroutine %d lock %p\n", gid, h.ptr)
-			printStack(Opts.LogBuf, stack)
-			fmt.Fprintln(Opts.LogBuf, "Previous place where the lock was grabbed (same goroutine)")
-			printStack(Opts.LogBuf, h.stack)
-			l.other(p)
-			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-				buf.Flush()
-			}
-			Opts.mu.Unlock()
-			return 1
+	for _, v := range violations {
+		Opts.mu.Lock()
+		fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
+		fmt.Fprintln(Opts.LogBuf, "happened before")
+		printStack(Opts.LogBuf, v.prevBefore)
+		fmt.Fprintln(Opts.LogBuf, "happened after")
+		printStack(Opts.LogBuf, v.prevAfter)
+		fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
+		printStack(Opts.LogBuf, v.curBefore)
+		fmt.Fprintln(Opts.LogBuf, "happened after")
+		printStack(Opts.LogBuf, v.curAfter)
+		l.other(ptr)
+		fmt.Fprintln(Opts.LogBuf)
+		if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
+			buf.Flush()
 		}
-		if before, after, violated := l.orders.checkAndRecord(
-			unsafe.Pointer(ptrFromInterface(h.ptr)),
-			unsafe.Pointer(ptrFromInterface(p)),
-			h.stack,
-			stack,
-		); violated {
-			Opts.mu.Lock()
-			fmt.Fprintln(Opts.LogBuf, header, "Inconsistent locking. saw this ordering in one goroutine:")
-			fmt.Fprintln(Opts.LogBuf, "happened before")
-			printStack(Opts.LogBuf, before)
-			fmt.Fprintln(Opts.LogBuf, "happened after")
-			printStack(Opts.LogBuf, after)
-			fmt.Fprintln(Opts.LogBuf, "in another goroutine: happened before")
-			printStack(Opts.LogBuf, h.stack)
-			fmt.Fprintln(Opts.LogBuf, "happened after")
-			printStack(Opts.LogBuf, stack)
-			l.other(p)
-			fmt.Fprintln(Opts.LogBuf)
-			if buf, ok := Opts.LogBuf.(*bufio.Writer); ok {
-				buf.Flush()
-			}
-			Opts.mu.Unlock()
-			violations++
-		}
+		Opts.mu.Unlock()
 	}
-	return violations
+	return len(violations)
 }
 
-// preAndPostLock checks lock ordering and registers the acquisition under a
-// single l.mu lock for the TryLock/TryRLock fast path.
-func (l *lockOrder) preAndPostLock(gid int64, stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) int {
-	l.mu.Lock()
-	violations := l.checkOrderLocked(gid, stack, p)
-	l.postLockLocked(gid, stack, buf, p)
-	l.mu.Unlock()
-	return violations
-}
-
-func (l *lockOrder) preLock(gid int64, stack []uintptr, p interface{}) {
+func (l *lockOrder) preLock(gid int64, stack []uintptr, ptr unsafe.Pointer) {
 	if Opts.DisableLockOrderDetection {
 		return
 	}
-	l.mu.Lock()
-	violations := l.checkOrderLocked(gid, stack, p)
-	l.mu.Unlock()
-	for i := 0; i < violations; i++ {
+	sh := &l.shards[hashGid(gid)]
+	sh.mu.Lock()
+	if sh.mask == 0 && len(sh.overflow) == 0 {
+		sh.mu.Unlock()
+		return
+	}
+	recursivePrev, recursiveCur, violations := l.checkShardLocked(sh, sh.mask, len(sh.overflow), gid, stack, ptr)
+	sh.mu.Unlock()
+
+	n := l.reportViolations(gid, ptr, recursivePrev, recursiveCur, violations)
+	for range n {
 		Opts.OnPotentialDeadlock()
 	}
 }
 
-func (l *lockOrder) postUnlock(p interface{}) {
-	gid := goid.Get()
-	l.mu.Lock()
-	hp := l.cur[p]
-	if hp == nil {
-		l.mu.Unlock()
-		return
-	}
-	holders := *hp
-	idx := -1
-	for i, h := range holders {
-		if h.gid == gid {
-			idx = i
-			break
-		}
-	}
-	ownerGID := gid
-	if idx >= 0 {
-		removedBuf := holders[idx].buf
-		holders[idx] = holders[len(holders)-1]
-		holders[len(holders)-1] = stackGID{}
-		holders = holders[:len(holders)-1]
-		releaseStackBuf(removedBuf)
-	} else if len(holders) > 0 {
-		// Cross-goroutine unlock: Go permits one goroutine to Lock and a different
-		// goroutine to Unlock, so the unlocking gid may not match any holder entry.
-		// This is a rare edge case in practice, the vast majority of code unlocks
-		// from the same goroutine that locked. We remove an arbitrary entry to keep
-		// the holder count consistent with the real lock state (the lock *was*
-		// released, so one entry must go). The trade-off: for RWMutex with multiple
-		// concurrent readers we may discard the wrong reader's stack trace, making a
-		// future deadlock report show a slightly misleading "previous lock site".
-		// Detection correctness is unaffected.
-		last := len(holders) - 1
-		ownerGID = holders[last].gid
-		removedBuf := holders[last].buf
-		holders[last] = stackGID{}
-		holders = holders[:last]
-		releaseStackBuf(removedBuf)
+func (l *lockOrder) postLock(gid int64, stack []uintptr, ptr unsafe.Pointer) {
+	sh := &l.shards[hashGid(gid)]
+	sh.mu.Lock()
+	if sh.mask != gidFullMask {
+		idx := bits.TrailingZeros8(^sh.mask)
+		slot := &sh.inline[idx]
+		slot.gid = gid
+		slot.ptr = ptr
+		slot.stackLen = uint8(copy(slot.stack[:], stack))
+		sh.mask |= uint8(1) << idx
 	} else {
-		ownerGID = -1
+		sh.overflow = append(sh.overflow, heldSlot{})
+		slot := &sh.overflow[len(sh.overflow)-1]
+		slot.gid = gid
+		slot.ptr = ptr
+		slot.stackLen = uint8(copy(slot.stack[:], stack))
 	}
-	if len(holders) == 0 {
-		// Delete the map key so the mutex pointer is not retained, allowing GC of
-		// the struct it's embedded in. Recycle the slice pointer via pool without
-		// boxing a slice header.
-		*hp = holders[:0]
-		delete(l.cur, p)
-		holdersPool.Put(hp)
-	} else {
-		*hp = holders
-	}
-	if ownerGID >= 0 {
-		if gh := l.byGid[ownerGID]; gh != nil {
-			held := *gh
-			for i := len(held) - 1; i >= 0; i-- {
-				if held[i].ptr == p {
-					held[i] = held[len(held)-1]
-					held[len(held)-1] = heldLock{}
-					held = held[:len(held)-1]
-					break
-				}
-			}
-			if len(held) == 0 {
-				*gh = held[:0]
-				delete(l.byGid, ownerGID)
-				heldPool.Put(gh)
-			} else {
-				*gh = held
-			}
-		}
-	}
-	l.mu.Unlock()
+	sh.mu.Unlock()
 }
 
-// Under lo.mu Locked.
-func (l *lockOrder) other(ptr interface{}) {
-	empty := true
-	for k, hp := range l.cur {
-		if k == ptr {
-			continue
-		}
-		if hp != nil && len(*hp) > 0 {
-			empty = false
-			break
+func (l *lockOrder) postUnlock(ptr unsafe.Pointer) {
+	gid := goid.Get()
+	ownIdx := hashGid(gid)
+	sh := &l.shards[ownIdx]
+	sh.mu.Lock()
+
+	// Fast path: single active slot owned by the unlocking goroutine.
+	if sh.mask == 1 && sh.inline[0].ptr == ptr && sh.inline[0].gid == gid {
+		sh.inline[0].ptr = nil
+		sh.mask = 0
+		sh.mu.Unlock()
+		return
+	}
+
+	// Search this goroutine's entries in its own shard first.
+	crossInlineIdx := -1
+	crossOverflowIdx := -1
+	for m := sh.mask; m != 0; m &= m - 1 {
+		i := bits.TrailingZeros8(m)
+		if sh.inline[i].ptr == ptr {
+			if sh.inline[i].gid == gid {
+				sh.inline[i].ptr = nil
+				sh.mask &^= uint8(1) << i
+				sh.mu.Unlock()
+				return
+			}
+			if crossInlineIdx < 0 {
+				crossInlineIdx = i
+			}
 		}
 	}
-	if empty {
+	for i := len(sh.overflow) - 1; i >= 0; i-- {
+		if sh.overflow[i].ptr == ptr {
+			if sh.overflow[i].gid == gid {
+				removeOverflowSlot(sh, i)
+				sh.mu.Unlock()
+				return
+			}
+			if crossOverflowIdx < 0 {
+				crossOverflowIdx = i
+			}
+		}
+	}
+
+	// Cross-goroutine unlock: Go permits one goroutine to Lock and another to
+	// Unlock. If another goroutine hashed to the same shard holds ptr, remove it
+	// directly; otherwise scan the remaining shards one by one.
+	if crossInlineIdx >= 0 {
+		sh.inline[crossInlineIdx].ptr = nil
+		sh.mask &^= uint8(1) << crossInlineIdx
+		sh.mu.Unlock()
+		return
+	}
+	if crossOverflowIdx >= 0 {
+		removeOverflowSlot(sh, crossOverflowIdx)
+		sh.mu.Unlock()
+		return
+	}
+	sh.mu.Unlock()
+
+	for i := range gidShardCount {
+		if uint64(i) == ownIdx {
+			continue
+		}
+		other := &l.shards[i]
+		other.mu.Lock()
+		if removeAnyByPtrLocked(other, ptr) {
+			other.mu.Unlock()
+			return
+		}
+		other.mu.Unlock()
+	}
+}
+
+func removeOverflowSlot(sh *gidShard, idx int) {
+	last := len(sh.overflow) - 1
+	sh.overflow[idx] = sh.overflow[last]
+	sh.overflow[last] = heldSlot{}
+	sh.overflow = sh.overflow[:last]
+}
+
+func removeAnyByPtrLocked(sh *gidShard, ptr unsafe.Pointer) bool {
+	for m := sh.mask; m != 0; m &= m - 1 {
+		i := bits.TrailingZeros8(m)
+		if sh.inline[i].ptr == ptr {
+			sh.inline[i].ptr = nil
+			sh.mask &^= uint8(1) << i
+			return true
+		}
+	}
+	for i := len(sh.overflow) - 1; i >= 0; i-- {
+		if sh.overflow[i].ptr == ptr {
+			removeOverflowSlot(sh, i)
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotHolders scans all shards sequentially (never holding two shard locks
+// at once) and returns copies of every active holder entry matching ptr.
+func (l *lockOrder) snapshotHolders(ptr unsafe.Pointer) []holderSnapshot {
+	var holders []holderSnapshot
+	for i := range l.shards {
+		sh := &l.shards[i]
+		sh.mu.Lock()
+		for m := sh.mask; m != 0; m &= m - 1 {
+			slot := &sh.inline[bits.TrailingZeros8(m)]
+			if slot.ptr == ptr {
+				holders = append(holders, holderSnapshot{
+					gid:   slot.gid,
+					ptr:   slot.ptr,
+					stack: copyStack(slot.stack[:slot.stackLen]),
+				})
+			}
+		}
+		for j := range sh.overflow {
+			slot := &sh.overflow[j]
+			if slot.ptr == ptr {
+				holders = append(holders, holderSnapshot{
+					gid:   slot.gid,
+					ptr:   slot.ptr,
+					stack: copyStack(slot.stack[:slot.stackLen]),
+				})
+			}
+		}
+		sh.mu.Unlock()
+	}
+	return holders
+}
+
+// Under Opts.mu locked, with no gidShard.mu held.
+func (l *lockOrder) other(ptr unsafe.Pointer) {
+	var others []holderSnapshot
+	for i := range l.shards {
+		sh := &l.shards[i]
+		sh.mu.Lock()
+		for m := sh.mask; m != 0; m &= m - 1 {
+			slot := &sh.inline[bits.TrailingZeros8(m)]
+			if slot.ptr != ptr {
+				others = append(others, holderSnapshot{
+					gid:   slot.gid,
+					ptr:   slot.ptr,
+					stack: copyStack(slot.stack[:slot.stackLen]),
+				})
+			}
+		}
+		for j := range sh.overflow {
+			slot := &sh.overflow[j]
+			if slot.ptr != ptr {
+				others = append(others, holderSnapshot{
+					gid:   slot.gid,
+					ptr:   slot.ptr,
+					stack: copyStack(slot.stack[:slot.stackLen]),
+				})
+			}
+		}
+		sh.mu.Unlock()
+	}
+	if len(others) == 0 {
 		return
 	}
 	fmt.Fprintln(Opts.LogBuf, "Other goroutines holding locks:")
-	for k, hp := range l.cur {
-		if k == ptr || hp == nil {
-			continue
-		}
-		for _, pp := range *hp {
-			fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", pp.gid, k)
-			printStack(Opts.LogBuf, pp.stack)
-		}
+	for _, pp := range others {
+		fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", pp.gid, pp.ptr)
+		printStack(Opts.LogBuf, pp.stack)
 	}
 	fmt.Fprintln(Opts.LogBuf)
 }

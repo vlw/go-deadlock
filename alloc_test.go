@@ -62,3 +62,25 @@ func BenchmarkLockUnlockWithBackgroundHolders(b *testing.B) {
 		mu.Unlock()
 	}
 }
+
+func BenchmarkParallelDisjointLockUnlock(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		var mu Mutex
+		for pb.Next() {
+			mu.Lock()
+			mu.Unlock()
+		}
+	})
+}
+
+func BenchmarkParallelNestedLockUnlock(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		var a, c Mutex
+		for pb.Next() {
+			a.Lock()
+			c.Lock()
+			c.Unlock()
+			a.Unlock()
+		}
+	})
+}
