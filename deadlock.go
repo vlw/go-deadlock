@@ -308,8 +308,8 @@ func (w *deadlockWatcher) deregister(e *pendingEntry) {
 
 func onDeadlockTimeout(e *pendingEntry) {
 	lo.mu.Lock()
-	holders, ok := lo.cur[e.ptr]
-	if !ok || len(holders) == 0 {
+	holdersPtr, ok := lo.cur[e.ptr]
+	if !ok || holdersPtr == nil || len(*holdersPtr) == 0 {
 		// Lock appears unheld (transient state, holder may have just released).
 		// Reschedule if the waiter is still pending. Note: this creates a new timer
 		// (e.timer is not updated), so if deregister runs later it will Stop() the
@@ -322,6 +322,7 @@ func onDeadlockTimeout(e *pendingEntry) {
 		}
 		return
 	}
+	holders := *holdersPtr
 	Opts.mu.Lock()
 	fmt.Fprintln(Opts.LogBuf, header)
 	for _, prev := range holders {
@@ -359,8 +360,8 @@ func onDeadlockTimeout(e *pendingEntry) {
 
 type lockOrder struct {
 	mu    sync.Mutex
-	cur   map[interface{}][]stackGID // stacktraces + gids for the locks currently taken.
-	order map[beforeAfter]ss         // expected order of locks.
+	cur   map[interface{}]*[]stackGID // stacktraces + gids for the locks currently taken.
+	order map[beforeAfter]ss          // expected order of locks.
 }
 
 type stackGID struct {
@@ -378,31 +379,35 @@ var lo = newLockOrder()
 
 func newLockOrder() *lockOrder {
 	return &lockOrder{
-		cur:   map[interface{}][]stackGID{},
+		cur:   map[interface{}]*[]stackGID{},
 		order: map[beforeAfter]ss{},
 	}
 }
 
-// holdersPool recycles []stackGID slices used by lockOrder.cur to track which
-// goroutines currently hold each lock. Slices are returned to the pool in
-// postUnlock when a lock's holder count drops to zero, and reused in postLock
-// for the next lock acquisition, avoiding a new slice allocation per mutex.
-var holdersPool sync.Pool
+// holdersPool recycles *[]stackGID slice pointers used by lockOrder.cur to track
+// which goroutines currently hold each lock. Storing pointers rather than slice
+// values avoids a 24-byte interface boxing allocation on every sync.Pool.Put.
+var holdersPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]stackGID, 0, 1)
+		return &s
+	},
+}
 
-// postLock records the current goroutine as a holder of lock p. It tries to
-// reuse a pooled []stackGID slice before allocating, and stores the pooled
+// postLock records the current goroutine as a holder of lock p. It reuses a
+// pooled *[]stackGID slice pointer before allocating, and stores the pooled
 // stack buffer in the entry so postUnlock can release it later.
 func (l *lockOrder) postLock(stack []uintptr, buf *[stackBufSize]uintptr, p interface{}) {
 	gid := goid.Get()
 	entry := stackGID{stack, gid, buf}
 	l.mu.Lock()
-	holders := l.cur[p]
-	if holders == nil {
-		if s, ok := holdersPool.Get().([]stackGID); ok {
-			holders = s[:0]
-		}
+	hp := l.cur[p]
+	if hp == nil {
+		hp = holdersPool.Get().(*[]stackGID)
+		*hp = (*hp)[:0]
+		l.cur[p] = hp
 	}
-	l.cur[p] = append(holders, entry)
+	*hp = append(*hp, entry)
 	l.mu.Unlock()
 }
 
@@ -412,7 +417,11 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 	}
 	gid := goid.Get()
 	l.mu.Lock()
-	for b, holders := range l.cur {
+	for b, hp := range l.cur {
+		if hp == nil {
+			continue
+		}
+		holders := *hp
 		if b == p {
 			for _, bs := range holders {
 				if bs.gid == gid {
@@ -470,7 +479,12 @@ func (l *lockOrder) preLock(stack []uintptr, p interface{}) {
 func (l *lockOrder) postUnlock(p interface{}) {
 	gid := goid.Get()
 	l.mu.Lock()
-	holders := l.cur[p]
+	hp := l.cur[p]
+	if hp == nil {
+		l.mu.Unlock()
+		return
+	}
+	holders := *hp
 	idx := -1
 	for i, h := range holders {
 		if h.gid == gid {
@@ -501,14 +515,13 @@ func (l *lockOrder) postUnlock(p interface{}) {
 	}
 	if len(holders) == 0 {
 		// Delete the map key so the mutex pointer is not retained, allowing GC of
-		// the struct it's embedded in. Recycle the backing slice via pool so the
-		// next postLock on any mutex can reuse it instead of allocating.
-		if cap(holders) > 0 {
-			holdersPool.Put(holders[:0])
-		}
+		// the struct it's embedded in. Recycle the slice pointer via pool without
+		// boxing a slice header.
+		*hp = holders[:0]
 		delete(l.cur, p)
+		holdersPool.Put(hp)
 	} else {
-		l.cur[p] = holders
+		*hp = holders
 	}
 	l.mu.Unlock()
 }
@@ -516,11 +529,11 @@ func (l *lockOrder) postUnlock(p interface{}) {
 // Under lo.mu Locked.
 func (l *lockOrder) other(ptr interface{}) {
 	empty := true
-	for k, holders := range l.cur {
+	for k, hp := range l.cur {
 		if k == ptr {
 			continue
 		}
-		if len(holders) > 0 {
+		if hp != nil && len(*hp) > 0 {
 			empty = false
 			break
 		}
@@ -529,11 +542,11 @@ func (l *lockOrder) other(ptr interface{}) {
 		return
 	}
 	fmt.Fprintln(Opts.LogBuf, "Other goroutines holding locks:")
-	for k, holders := range l.cur {
-		if k == ptr {
+	for k, hp := range l.cur {
+		if k == ptr || hp == nil {
 			continue
 		}
-		for _, pp := range holders {
+		for _, pp := range *hp {
 			fmt.Fprintf(Opts.LogBuf, "goroutine %v lock %p\n", pp.gid, k)
 			printStack(Opts.LogBuf, pp.stack)
 		}
